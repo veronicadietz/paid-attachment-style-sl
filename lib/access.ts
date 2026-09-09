@@ -1,5 +1,3 @@
-import { env } from 'cloudflare:workers';
-
 function encode(value: string) {
   const bytes = new TextEncoder().encode(value);
   let binary = '';
@@ -19,16 +17,18 @@ async function sign(value: string, secret: string) {
 }
 
 export async function createAccessToken(email: string) {
-  if (!env.ASSESSMENT_SIGNING_SECRET) return 'local-demo-access';
+  const secret = process.env.ASSESSMENT_SIGNING_SECRET;
+  if (!secret) return 'local-demo-access';
   const payload = encode(JSON.stringify({ email: email.toLowerCase(), exp: Date.now() + 12 * 60 * 60 * 1000 }));
-  return `${payload}.${await sign(payload, env.ASSESSMENT_SIGNING_SECRET)}`;
+  return `${payload}.${await sign(payload, secret)}`;
 }
 
 export async function verifyAccessToken(email: string, token?: string) {
-  if (!env.ASSESSMENT_SIGNING_SECRET) return true;
+  const secret = process.env.ASSESSMENT_SIGNING_SECRET;
+  if (!secret) return true;
   if (!token) return false;
   const [payload, signature] = token.split('.');
-  if (!payload || !signature || signature !== await sign(payload, env.ASSESSMENT_SIGNING_SECRET)) return false;
+  if (!payload || !signature || signature !== await sign(payload, secret)) return false;
   try {
     const data = JSON.parse(decode(payload)) as { email: string; exp: number };
     return data.email === email.toLowerCase() && data.exp > Date.now();
