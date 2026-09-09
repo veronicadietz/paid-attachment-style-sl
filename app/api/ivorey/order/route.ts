@@ -1,20 +1,31 @@
-import { env } from 'cloudflare:workers';
+import { blobIsConfigured, savePurchase } from '@/lib/blob-store';
 
-export const runtime = 'edge';
+export const runtime = 'nodejs';
 
 export async function POST(request: Request) {
-  if (!env.IVOREY_WEBHOOK_SECRET || request.headers.get('x-ivorey-secret') !== env.IVOREY_WEBHOOK_SECRET) {
+  const secret = process.env.IVOREY_WEBHOOK_SECRET;
+  if (!secret || request.headers.get('x-ivorey-secret') !== secret) {
     return Response.json({ error: 'Unauthorized webhook.' }, { status: 401 });
   }
+  if (!blobIsConfigured()) return Response.json({ error: 'Vercel Blob is not configured.' }, { status: 503 });
+
   const body = await request.json() as { orderId?: string; email?: string; firstName?: string; contactId?: string; productName?: string; amountCents?: number | string };
   const email = body.email?.trim().toLowerCase() ?? '';
   const orderId = body.orderId?.trim() ?? '';
   if (!orderId || !/^\S+@\S+\.\S+$/.test(email)) return Response.json({ error: 'orderId and email are required.' }, { status: 400 });
   const amount = Number(body.amountCents ?? 4700);
-  await env.DB.prepare(`INSERT INTO purchases (id, order_id, first_name, email, ivorey_contact_id, product_name, amount_cents, status, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, 'paid', ?)
-    ON CONFLICT(order_id) DO UPDATE SET status = 'paid', email = excluded.email, ivorey_contact_id = excluded.ivorey_contact_id`)
-    .bind(crypto.randomUUID(), orderId, body.firstName?.trim().slice(0, 80) || 'Customer', email, body.contactId ?? null, body.productName?.trim() || 'Personalized Attachment Profile', Number.isFinite(amount) ? amount : 4700, Date.now())
-    .run();
+
+  await savePurchase({
+    id: crypto.randomUUID(),
+    orderId,
+    firstName: body.firstName?.trim().slice(0, 80) || 'Customer',
+    email,
+    ivoreyContactId: body.contactId ?? null,
+    productName: body.productName?.trim() || 'Personalized Attachment Profile',
+    amountCents: Number.isFinite(amount) ? amount : 4700,
+    status: 'paid',
+    createdAt: new Date().toISOString(),
+  });
+
   return Response.json({ received: true }, { status: 201 });
 }

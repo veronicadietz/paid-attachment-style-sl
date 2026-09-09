@@ -1,41 +1,14 @@
-import { env } from 'cloudflare:workers';
+import { readFile } from 'node:fs/promises';
+import { join } from 'node:path';
 
 import { scoreAssessment } from '@/lib/assessment';
 import { verifyAccessToken } from '@/lib/access';
+import { blobIsConfigured, saveAssessment, saveReport, sha256 } from '@/lib/blob-store';
 import { createAttachmentReport } from '@/lib/report';
 
-export const runtime = 'edge';
+export const runtime = 'nodejs';
 
 const emailPattern = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-
-function bytesToBase64(bytes: Uint8Array) {
-  let binary = '';
-  const chunk = 0x8000;
-  for (let index = 0; index < bytes.length; index += chunk) binary += String.fromCharCode(...bytes.subarray(index, index + chunk));
-  return btoa(binary);
-}
-
-async function sha256(value: string) {
-  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(value));
-  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('');
-}
-
-async function sendDeliveryEmail(email: string, firstName: string, pdf: Uint8Array, downloadUrl: string) {
-  if (!env.RESEND_API_KEY) return 'not_configured';
-  const response = await fetch('https://api.resend.com/emails', {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${env.RESEND_API_KEY}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      from: 'Securely Loved <bev@securelyloved.com>',
-      to: [email],
-      subject: `${firstName}, your Personalized Attachment Profile is ready`,
-      html: `<p>Hi ${firstName},</p><p>Your Personalized Attachment Profile is ready. A copy is attached, and you can also <a href="${downloadUrl}">download it securely here</a> for the next seven days.</p><p>Please save the report somewhere private where you can return to it.</p><p>With care,<br>Bev<br>Securely Loved</p>`,
-      attachments: [{ filename: 'personalized-attachment-profile.pdf', content: bytesToBase64(pdf) }],
-    }),
-  });
-  if (!response.ok) throw new Error(`Email provider returned ${response.status}.`);
-  return 'sent';
-}
 
 export async function POST(request: Request) {
   try {
@@ -45,7 +18,12 @@ export async function POST(request: Request) {
     if (!firstName || !emailPattern.test(email) || !Array.isArray(body.answers)) {
       return Response.json({ error: 'Please provide a valid first name, email, and all assessment answers.' }, { status: 400 });
     }
-    if (!await verifyAccessToken(email, body.accessToken)) return Response.json({ error: 'Your paid assessment access has expired. Please return through your purchase email.' }, { status: 403 });
+    if (!await verifyAccessToken(email, body.accessToken)) {
+      return Response.json({ error: 'Your paid assessment access has expired. Please return through your purchase email.' }, { status: 403 });
+    }
+    if (!blobIsConfigured()) {
+      return Response.json({ error: 'Report storage is not configured yet.' }, { status: 503 });
+    }
 
     const scores = scoreAssessment(body.answers);
     const id = crypto.randomUUID();
@@ -53,42 +31,50 @@ export async function POST(request: Request) {
     const downloadTokenHash = await sha256(downloadToken);
     const createdAt = new Date();
     const downloadExpiresAt = new Date(createdAt.getTime() + 7 * 24 * 60 * 60 * 1000);
-    const logoResponse = await fetch(new URL('/securely-loved-logo.png', request.url));
-    const logoBytes = logoResponse.ok ? new Uint8Array(await logoResponse.arrayBuffer()) : undefined;
+    const logoBytes = new Uint8Array(await readFile(join(process.cwd(), 'public', 'securely-loved-logo.png')));
     const pdf = await createAttachmentReport({ firstName, completedAt: createdAt.toISOString(), scores, logoBytes });
-    const reportKey = `reports/${createdAt.getUTCFullYear()}/${id}.pdf`;
-    await env.FILES.put(reportKey, pdf, { httpMetadata: { contentType: 'application/pdf' } });
+    const reportPath = `reports/${createdAt.getUTCFullYear()}/${id}.pdf`;
 
-    await env.DB.prepare(`INSERT INTO assessments (
-      id, first_name, email, ivorey_contact_id, answers_json, scores_json,
-      primary_style, secondary_style, is_blend, report_key, download_token_hash,
-      download_expires_at, email_status, created_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-      .bind(id, firstName, email, body.ivoreyContactId ?? null, JSON.stringify(body.answers), JSON.stringify(scores), scores.primary, scores.secondary, scores.isBlend ? 1 : 0, reportKey, downloadTokenHash, downloadExpiresAt.getTime(), 'pending', createdAt.getTime())
-      .run();
+    await saveReport(reportPath, pdf);
+    await saveAssessment({
+      id,
+      firstName,
+      email,
+      ivoreyContactId: body.ivoreyContactId ?? null,
+      reportPath,
+      downloadTokenHash,
+      downloadExpiresAt: downloadExpiresAt.getTime(),
+      createdAt: createdAt.toISOString(),
+    });
 
     const downloadUrl = `${new URL(request.url).origin}/api/reports/${id}?token=${downloadToken}`;
-    let emailStatus = 'not_configured';
-    try {
-      emailStatus = await sendDeliveryEmail(email, firstName, pdf, downloadUrl);
-    } catch (error) {
-      emailStatus = 'failed';
-      console.error('Delivery email failed', error);
-    }
-    await env.DB.prepare('UPDATE assessments SET email_status = ? WHERE id = ?').bind(emailStatus, id).run();
-
-    if (env.IVOREY_RESULT_WEBHOOK_URL) {
+    let deliveryStatus = 'not_configured';
+    if (process.env.IVOREY_RESULT_WEBHOOK_URL) {
       try {
-        await fetch(env.IVOREY_RESULT_WEBHOOK_URL, {
-          method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ event: 'attachment_profile.completed', assessmentId: id, firstName, email, ivoreyContactId: body.ivoreyContactId ?? null, primaryStyle: scores.primary, secondaryStyle: scores.secondary, isBlend: scores.isBlend, reportUrl: downloadUrl, completedAt: createdAt.toISOString() }),
+        const response = await fetch(process.env.IVOREY_RESULT_WEBHOOK_URL, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            event: 'attachment_profile.completed',
+            assessmentId: id,
+            firstName,
+            email,
+            ivoreyContactId: body.ivoreyContactId ?? null,
+            primaryStyle: scores.primary,
+            secondaryStyle: scores.secondary,
+            isBlend: scores.isBlend,
+            reportUrl: downloadUrl,
+            completedAt: createdAt.toISOString(),
+          }),
         });
+        deliveryStatus = response.ok ? 'sent_to_ivorey' : 'failed';
       } catch (error) {
+        deliveryStatus = 'failed';
         console.error('Ivorey result webhook failed', error);
       }
     }
 
-    return Response.json({ id, scores, downloadUrl, emailStatus });
+    return Response.json({ id, scores, downloadUrl, emailStatus: deliveryStatus });
   } catch (error) {
     console.error('Assessment submission failed', error);
     return Response.json({ error: error instanceof Error ? error.message : 'We could not create the report. Please try again.' }, { status: 500 });
