@@ -1,9 +1,3 @@
-declare namespace Cloudflare {
-  interface Env {
-    FILES: R2Bucket;
-  }
-}
-
 interface Document {
   modelContext?: {
     registerTool(tool: {
