@@ -11,6 +11,16 @@ pnpm dev
 
 The hosted app uses D1 (`DB`) for purchases and assessment records and R2 (`FILES`) for private PDF files. Drizzle migrations live in `drizzle/`.
 
+## Deploy from GitHub
+
+This repository is configured for Cloudflare Workers through `wrangler.jsonc` and does not depend on an OpenAI Sites project. Before the first deployment:
+
+1. Create a D1 database named `securely-loved-attachment-profile` and replace the placeholder `database_id` in `wrangler.jsonc`.
+2. Create an R2 bucket named `securely-loved-attachment-reports`.
+3. Apply the SQL migrations in `drizzle/` to the D1 database.
+4. Add the four values from `.env.example` as encrypted Worker secrets.
+5. Connect this GitHub repository to Cloudflare Workers Builds, then use `pnpm build` as the build command.
+
 ## Ivorey handoff
 
 Configure an Ivorey workflow triggered by **Order Submitted** for the $47 Personalized Attachment Profile. Add a POST webhook to:
